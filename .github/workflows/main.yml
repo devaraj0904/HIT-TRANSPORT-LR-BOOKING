@@ -1,0 +1,176 @@
+name: Build HIT Transport APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Prepare project files
+        run: |
+          APP=$(ls -S *.html 2>/dev/null | head -1 || true)
+          if [ -z "$APP" ]; then
+            echo "::error::HTML file illai. Hit_Transport_Live_Tracking.html file-ai repo-la upload pannunga."
+            exit 1
+          fi
+          echo "App file: $APP"
+          mkdir -p www assets scripts
+          cp "$APP" www/index.html
+          cat > package.json << 'EOF'
+          {
+            "name": "hit-transport-app",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/android": "^6.1.0",
+              "@capacitor/cli": "^6.1.0",
+              "@capacitor/core": "^6.1.0",
+              "@capacitor/filesystem": "^6.0.0",
+              "@capacitor/share": "^6.0.0",
+              "@capacitor-community/background-geolocation": "^1.2.0"
+            }
+          }
+          EOF
+          cat > capacitor.config.json << 'EOF'
+          {
+            "appId": "com.hittransport.app",
+            "appName": "HIT Transport",
+            "webDir": "www",
+            "server": { "androidScheme": "https", "allowNavigation": ["*.netlify.app", "hittransport.in", "*.hittransport.in"] },
+            "android": { "useLegacyBridge": true }
+          }
+          EOF
+          python3 - << 'EOF'
+          import re
+          s = open('www/index.html', encoding='utf-8').read()
+          m = re.search(r'HIT_LOGO_SRC = "data:image/png;base64,([A-Za-z0-9+/=]+)"', s)
+          if not m:
+              raise SystemExit('Logo not found in HTML - upload the latest HTML file')
+          import base64
+          open('assets/logo.png', 'wb').write(base64.b64decode(m.group(1)))
+          print('logo extracted')
+          EOF
+          cat > scripts/prepare_android.py << 'EOF'
+          import os, re
+          from PIL import Image
+          root = os.getcwd()
+          android = os.path.join(root, 'android')
+          manifest = os.path.join(android, 'app/src/main/AndroidManifest.xml')
+          perms = ['ACCESS_COARSE_LOCATION', 'ACCESS_FINE_LOCATION', 'FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_LOCATION', 'CAMERA']
+          x = open(manifest, encoding='utf-8').read()
+          add = ''.join('    <uses-permission android:name="android.permission.%s" />\n' % p for p in perms if p not in x)
+          if 'android.hardware.camera' not in x:
+              add += '    <uses-feature android:name="android.hardware.camera" android:required="false" />\n'
+          if add:
+              x = x.replace('</manifest>', add + '</manifest>')
+          open(manifest, 'w', encoding='utf-8').write(x)
+          logo = Image.open(os.path.join(root, 'assets/logo.png')).convert('RGBA')
+          sizes = {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96, 'xxhdpi': 144, 'xxxhdpi': 192}
+          res = os.path.join(android, 'app/src/main/res')
+          def fit(canvas, scale, bg):
+              c = Image.new('RGBA', (canvas, canvas), bg)
+              h = int(canvas * scale); w = int(h * logo.width / logo.height)
+              c.alpha_composite(logo.resize((w, h), Image.LANCZOS), ((canvas - w) // 2, (canvas - h) // 2))
+              return c
+          for d, px in sizes.items():
+              folder = os.path.join(res, 'mipmap-' + d)
+              if not os.path.isdir(folder):
+                  continue
+              fit(px, 0.86, (255, 255, 255, 255)).save(os.path.join(folder, 'ic_launcher.png'))
+              fit(px, 0.86, (255, 255, 255, 255)).save(os.path.join(folder, 'ic_launcher_round.png'))
+              fit(int(px * 108 / 48), 0.56, (0, 0, 0, 0)).save(os.path.join(folder, 'ic_launcher_foreground.png'))
+          bgxml = os.path.join(res, 'values/ic_launcher_background.xml')
+          if os.path.isdir(os.path.dirname(bgxml)):
+              open(bgxml, 'w').write('<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#FFFFFF</color>\n</resources>\n')
+          g = open(os.path.join(android, 'app/build.gradle'), encoding='utf-8').read()
+          run = os.environ.get('HIT_VC', os.environ.get('GITHUB_RUN_NUMBER', '1'))
+          g = re.sub(r'versionCode\s+\d+', 'versionCode ' + run, g)
+          g = re.sub(r'versionName\s+"[^"]*"', 'versionName "1.0.' + run + '"', g)
+          open(os.path.join(android, 'app/build.gradle'), 'w', encoding='utf-8').write(g)
+          print('android prepared, versionCode', run)
+          EOF
+      - name: Version number (always higher than the last build)
+        run: |
+          echo "HIT_VC=$(( $(date +%s) / 60 ))" >> "$GITHUB_ENV"
+      - name: Install packages
+        run: |
+          npm install --legacy-peer-deps
+          pip install pillow
+      - name: Add Android project
+        run: |
+          npx cap add android
+          python3 scripts/prepare_android.py
+          npx cap sync android
+      - name: Check plugins are installed
+        run: |
+          cat android/app/src/main/assets/capacitor.plugins.json
+          for p in Filesystem Share BackgroundGeolocation; do
+            grep -q "$p" android/app/src/main/assets/capacitor.plugins.json || { echo "::error::Plugin missing: $p"; exit 1; }
+          done
+      - name: Signing keys (made once, then kept in the repo)
+        run: |
+          mkdir -p ~/.android
+          NEWKEY=0
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair -v -keystore debug.keystore -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=HIT Transport,O=HIT,C=IN"
+            NEWKEY=1
+            echo "::warning::debug.keystore was missing, a new one was made and saved. If the phone says App not installed, uninstall the old app ONE time. After that every update installs over it."
+          fi
+          if [ ! -f upload.keystore ]; then
+            keytool -genkeypair -v -keystore upload.keystore -storepass hitupload123 -keypass hitupload123 -alias upload -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=HIT Transport,O=HIT,C=IN"
+            NEWKEY=1
+          fi
+          cp debug.keystore ~/.android/debug.keystore
+          echo "NEWKEY=$NEWKEY" >> "$GITHUB_ENV"
+      - name: Build APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+      - name: Name the APK
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk HIT-Transport.apk
+      - name: Build Play Store bundle (AAB)
+        working-directory: android
+        run: |
+          ./gradlew bundleRelease
+          cp app/build/outputs/bundle/release/app-release.aab ../HIT-Transport-PlayStore.aab
+          jarsigner -keystore ../upload.keystore -storepass hitupload123 -keypass hitupload123 ../HIT-Transport-PlayStore.aab upload
+          jarsigner -verify ../HIT-Transport-PlayStore.aab | head -3
+      - name: Save keys in the repo (only when newly made)
+        if: env.NEWKEY == '1'
+        run: |
+          git config user.name "hit-build"
+          git config user.email "hit-build@users.noreply.github.com"
+          git add -f debug.keystore upload.keystore
+          git commit -m "Add signing keys" || true
+          git push || echo "::warning::Could not save keys to repo. Upload debug.keystore and upload.keystore from the Artifacts zip."
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HIT-Transport-APK
+          path: HIT-Transport.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HIT-Transport-PlayStore-AAB
+          path: |
+            HIT-Transport-PlayStore.aab
+            debug.keystore
+            upload.keystore
+      - name: Publish APK as a Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: HIT Transport APK #${{ github.run_number }}
+          files: |
+            HIT-Transport.apk
+            HIT-Transport-PlayStore.aab
