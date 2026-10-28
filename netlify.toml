@@ -1,0 +1,13 @@
+[build]
+  publish = "."
+  command = '''
+  cp Hit_Transport_Live_Tracking.html index.html
+  B=$(grep -o "APP_BUILD = '[^']*'" index.html | head -1 | sed "s/APP_BUILD = '//; s/'$//")
+  printf '{"build":"%s"}' "$B" > version.json
+  cat version.json
+  '''
+
+[[headers]]
+  for = "/version.json"
+  [headers.values]
+    Cache-Control = "no-store"
