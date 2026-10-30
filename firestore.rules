@@ -1,0 +1,49 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn()   { return request.auth != null; }
+    function hasProfile() { return signedIn() && exists(/databases/$(database)/documents/profiles/$(request.auth.uid)); }
+    function prof()       { return get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data; }
+    function isAdmin()    { return hasProfile() && prof().roleType == 'admin'; }
+    function isBranch()   { return hasProfile() && prof().roleType == 'branch'; }
+    function isDriver()   { return hasProfile() && prof().roleType == 'driver'; }
+    function isStaff()    { return isAdmin() || isBranch(); }
+    function myId()       { return prof().legacyId; }
+
+    // login lookup + security flag (public, but only single-document reads)
+    match /app_meta/{d}   { allow get: if true;  allow list: if false; allow write: if isAdmin(); }
+    match /login_map/{d}  { allow get: if true;  allow list: if false; allow write: if isAdmin(); }
+
+    match /profiles/{uid} {
+      allow get:   if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow list:  if isAdmin();
+      allow write: if isAdmin();
+    }
+
+    match /users/{id}         { allow read: if isStaff(); allow write: if isAdmin(); }
+    match /system_config/{d}  { allow read, write: if isAdmin(); }
+
+    match /lrs/{id} {
+      allow read:   if hasProfile();
+      allow create: if isStaff();
+      allow update: if isStaff() || (isDriver() && resource.data.driverId == myId()
+                        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['trackStatus','reachedAt','reachedBy']));
+      allow delete: if isAdmin();
+    }
+    match /cancelled_lrs/{id} { allow read: if isAdmin(); allow create: if isStaff(); allow update, delete: if isAdmin(); }
+
+    match /trips/{id}         { allow read: if isStaff() || isDriver(); allow write: if isStaff(); }
+    match /live_tracking/{id} { allow read: if isStaff(); allow write: if isAdmin() || (isDriver() && myId() == id); }
+    match /driver_sessions/{id} { allow read, write: if isAdmin() || (isDriver() && myId() == id); }
+    match /pod_signs/{id}     { allow read: if isStaff(); allow create, update: if isStaff() || isDriver(); allow delete: if isAdmin(); }
+
+    // Door Delivery accounts (Admin + Branch only; branch can only see/edit its own city in the app)
+    match /dd_costs/{id} { allow read, write: if isAdmin() || isBranch(); }
+    match /dd_rates/{id} { allow read, write: if isAdmin() || isBranch(); }
+
+    // customer-facing links (unguessable id / non-sensitive fields only)
+    match /public_tracking/{id} { allow get: if true; allow list: if false; allow create, update: if isStaff() || isDriver(); allow delete: if isStaff(); }
+    match /shared_copies/{id}   { allow get: if true; allow list: if false; allow create, update: if isStaff(); allow delete: if isAdmin(); }
+  }
+}
